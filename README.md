@@ -29,7 +29,7 @@ This repository focuses on the hardware tracking and following layer.
 ## What This Repository Contains
 
 ```text
-    turtlebot4-sft-aruco-kf-pf-recovery/
+turtlebot4-sft-aruco-kf-pf-recovery/
 ├── board_pose_ros/
 │   ├── board_pose_ros/
 │   │   └── board_pose_node.py
@@ -276,7 +276,7 @@ Clone into a ROS 2 workspace:
 mkdir -p ~/ros2_ws/src
 cd ~/ros2_ws/src
 
-git clone https://github.com/Mobile-Robots-UGV/    turtlebot4-sft-aruco-kf-pf-recovery.git
+git clone https://github.com/Mobile-Robots-UGV/turtlebot4-sft-aruco-kf-pf-recovery.git
 ```
 
 Build:
