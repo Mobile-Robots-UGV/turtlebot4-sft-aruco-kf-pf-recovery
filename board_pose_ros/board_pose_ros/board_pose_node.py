@@ -8,10 +8,12 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import PoseStamped, Vector3Stamped, TransformStamped
-from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool, Int32MultiArray
-from tf2_ros import TransformBroadcaster
+from geometry_msgs.msg import PoseStamped, Vector3Stamped, TransformStamped, Point
+from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import Bool, Int32MultiArray, ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
+from cv_bridge import CvBridge
+from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 
 
 DICT_MAP = {
@@ -122,13 +124,35 @@ class BoardPoseNode(Node):
 
         self.board_object_points = self._build_board_object_points()
 
-        self.pose_pub = self.create_publisher(PoseStamped, "/robot_09/board_pose", 10)
-        self.rpy_pub = self.create_publisher(Vector3Stamped, "/robot_09/board_rpy", 10)
-        self.visible_pub = self.create_publisher(Bool, "/robot_09/board_visible", 10)
-        self.ids_pub = self.create_publisher(Int32MultiArray, "/robot_09/board_used_ids", 10)
-        self.ids_pub = self.create_publisher(Int32MultiArray, "/board_used_ids", 10)
+        # ── cv_bridge ────────────────────────────────────────────────────
+        self.bridge = CvBridge()
+
+        # ── Static TF: map → oak_camera_frame (always exists) ────────────
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        static_msg = TransformStamped()
+        static_msg.header.stamp = self.get_clock().now().to_msg()
+        static_msg.header.frame_id = 'map'
+        static_msg.child_frame_id = self.camera_frame
+        static_msg.transform.rotation.w = 1.0
+        self.static_tf_broadcaster.sendTransform(static_msg)
+
+        # ── Dynamic TF broadcaster (board_frame when detected) ───────────
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        # ── Original publishers ──────────────────────────────────────────
+        self.pose_pub    = self.create_publisher(PoseStamped,      "/robot_09/board_pose",       10)
+        self.rpy_pub     = self.create_publisher(Vector3Stamped,   "/robot_09/board_rpy",        10)
+        self.visible_pub = self.create_publisher(Bool,             "/robot_09/board_visible",    10)
+        self.ids_pub     = self.create_publisher(Int32MultiArray,  "/robot_09/board_used_ids",   10)
+        self.ids_pub2    = self.create_publisher(Int32MultiArray,  "/board_used_ids",            10)
+
+        # ── New publishers ───────────────────────────────────────────────
+        self.debug_image_pub = self.create_publisher(
+            Image, "/robot_09/board_debug_image", 10)
+        self.markers_pub = self.create_publisher(
+            MarkerArray, "/robot_09/board_markers", 10)
+
+        # ── Subscriber ───────────────────────────────────────────────────
         self.sub = self.create_subscription(
             CompressedImage,
             self.image_topic,
@@ -140,8 +164,66 @@ class BoardPoseNode(Node):
         self.get_logger().info(f"Subscribed to {self.image_topic}")
         self.get_logger().info(f"Calibration file: {self.calibration_file}")
         self.get_logger().info(f"Board config file: {self.board_config_file}")
+        self.get_logger().info(f"Static TF published: map → {self.camera_frame}")
 
+    # ──────────────────────────────────────────────────────────────────────
+    #  RViz2 marker helpers
+    # ──────────────────────────────────────────────────────────────────────
+    def _make_sphere(self, mid, x, y, z, r, g, b, a=1.0, size=0.06):
+        m = Marker()
+        m.header.frame_id    = self.camera_frame
+        m.header.stamp       = self.get_clock().now().to_msg()
+        m.ns                 = 'board_pose'
+        m.id                 = mid
+        m.type               = Marker.SPHERE
+        m.action             = Marker.ADD
+        m.pose.position.x    = float(x)
+        m.pose.position.y    = float(y)
+        m.pose.position.z    = float(z)
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = size
+        m.color              = ColorRGBA(r=float(r), g=float(g), b=float(b), a=float(a))
+        m.lifetime           = rclpy.duration.Duration(seconds=0.3).to_msg()
+        return m
 
+    def _make_text(self, mid, x, y, z, text, r, g, b):
+        m = Marker()
+        m.header.frame_id    = self.camera_frame
+        m.header.stamp       = self.get_clock().now().to_msg()
+        m.ns                 = 'board_text'
+        m.id                 = mid
+        m.type               = Marker.TEXT_VIEW_FACING
+        m.action             = Marker.ADD
+        m.pose.position.x    = float(x)
+        m.pose.position.y    = float(y)
+        m.pose.position.z    = float(z)
+        m.pose.orientation.w = 1.0
+        m.scale.z            = 0.05
+        m.color              = ColorRGBA(r=float(r), g=float(g), b=float(b), a=1.0)
+        m.text               = text
+        m.lifetime           = rclpy.duration.Duration(seconds=0.3).to_msg()
+        return m
+
+    def _make_line(self, mid, x, y, z, r, g, b):
+        """Line from camera origin to board center."""
+        m = Marker()
+        m.header.frame_id = self.camera_frame
+        m.header.stamp    = self.get_clock().now().to_msg()
+        m.ns              = 'board_line'
+        m.id              = mid
+        m.type            = Marker.LINE_STRIP
+        m.action          = Marker.ADD
+        p0 = Point(); p0.x = 0.0; p0.y = 0.0; p0.z = 0.0
+        p1 = Point(); p1.x = float(x); p1.y = float(y); p1.z = float(z)
+        m.points          = [p0, p1]
+        m.scale.x         = 0.01
+        m.color           = ColorRGBA(r=float(r), g=float(g), b=float(b), a=0.5)
+        m.lifetime        = rclpy.duration.Duration(seconds=0.3).to_msg()
+        return m
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Board object points
+    # ──────────────────────────────────────────────────────────────────────
     def _build_board_object_points(self) -> dict[int, np.ndarray]:
         result = {}
         size = self.marker_size_m
@@ -178,6 +260,9 @@ class BoardPoseNode(Node):
 
         return result
 
+    # ──────────────────────────────────────────────────────────────────────
+    #  Main image callback
+    # ──────────────────────────────────────────────────────────────────────
     def image_callback(self, msg: CompressedImage) -> None:
         np_arr = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -193,17 +278,29 @@ class BoardPoseNode(Node):
         )
 
         visible_msg = Bool()
-        ids_msg = Int32MultiArray()
+        ids_msg     = Int32MultiArray()
+        marker_array = MarkerArray()
 
+        # ── No markers detected ──────────────────────────────────────────
         if ids is None or len(ids) == 0:
             visible_msg.data = False
             self.visible_pub.publish(visible_msg)
             self.ids_pub.publish(ids_msg)
+            self.ids_pub2.publish(ids_msg)
+            self.markers_pub.publish(marker_array)
+
+            # Still publish debug image (no overlay)
+            cv2.putText(frame, 'No board detected',
+                (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            debug_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+            debug_msg.header = msg.header
+            self.debug_image_pub.publish(debug_msg)
             return
 
+        # ── Build correspondences ────────────────────────────────────────
         object_points = []
-        image_points = []
-        used_ids = []
+        image_points  = []
+        used_ids      = []
 
         ids_flat = ids.flatten().tolist()
         for marker_corners, marker_id in zip(corners, ids_flat):
@@ -221,10 +318,19 @@ class BoardPoseNode(Node):
             visible_msg.data = False
             self.visible_pub.publish(visible_msg)
             self.ids_pub.publish(ids_msg)
+            self.ids_pub2.publish(ids_msg)
+            self.markers_pub.publish(marker_array)
+
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+            cv2.putText(frame, 'Markers detected - none match config',
+                (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            debug_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+            debug_msg.header = msg.header
+            self.debug_image_pub.publish(debug_msg)
             return
 
         object_points = np.vstack(object_points)
-        image_points = np.vstack(image_points)
+        image_points  = np.vstack(image_points)
 
         success, rvec, tvec = cv2.solvePnP(
             object_points,
@@ -238,50 +344,120 @@ class BoardPoseNode(Node):
             visible_msg.data = False
             self.visible_pub.publish(visible_msg)
             self.ids_pub.publish(ids_msg)
+            self.ids_pub2.publish(ids_msg)
+            self.markers_pub.publish(marker_array)
+
+            cv2.putText(frame, 'solvePnP failed',
+                (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            debug_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+            debug_msg.header = msg.header
+            self.debug_image_pub.publish(debug_msg)
             return
 
+        # ── Pose computation ─────────────────────────────────────────────
         rot_mtx, _ = cv2.Rodrigues(rvec)
         roll, pitch, yaw = rotation_matrix_to_rpy(rot_mtx)
         quat = rvec_to_quaternion(rvec)
+
+        x_m = float(tvec[0][0])
+        y_m = float(tvec[1][0])
+        z_m = float(tvec[2][0])
 
         header = msg.header
         if not header.frame_id:
             header.frame_id = self.camera_frame
 
+        # ── Publish pose ─────────────────────────────────────────────────
         pose_msg = PoseStamped()
-        pose_msg.header = header
-        pose_msg.header.frame_id = self.camera_frame
-        pose_msg.pose.position.x = float(tvec[0][0])
-        pose_msg.pose.position.y = float(tvec[1][0])
-        pose_msg.pose.position.z = float(tvec[2][0])
-        pose_msg.pose.orientation.x = float(quat[0])
-        pose_msg.pose.orientation.y = float(quat[1])
-        pose_msg.pose.orientation.z = float(quat[2])
-        pose_msg.pose.orientation.w = float(quat[3])
+        pose_msg.header              = header
+        pose_msg.header.frame_id     = self.camera_frame
+        pose_msg.pose.position.x     = x_m
+        pose_msg.pose.position.y     = y_m
+        pose_msg.pose.position.z     = z_m
+        pose_msg.pose.orientation.x  = float(quat[0])
+        pose_msg.pose.orientation.y  = float(quat[1])
+        pose_msg.pose.orientation.z  = float(quat[2])
+        pose_msg.pose.orientation.w  = float(quat[3])
         self.pose_pub.publish(pose_msg)
 
+        # ── Publish RPY ──────────────────────────────────────────────────
         rpy_msg = Vector3Stamped()
-        rpy_msg.header = pose_msg.header
+        rpy_msg.header   = pose_msg.header
         rpy_msg.vector.x = float(roll)
         rpy_msg.vector.y = float(pitch)
         rpy_msg.vector.z = float(yaw)
         self.rpy_pub.publish(rpy_msg)
 
+        # ── Publish visibility and IDs ───────────────────────────────────
         visible_msg.data = True
         self.visible_pub.publish(visible_msg)
 
         ids_msg.data = used_ids
         self.ids_pub.publish(ids_msg)
+        self.ids_pub2.publish(ids_msg)
 
+        # ── Publish dynamic TF (camera → board) ──────────────────────────
         tf_msg = TransformStamped()
-        tf_msg.header = pose_msg.header
-        tf_msg.child_frame_id = self.board_frame
-        tf_msg.transform.translation.x = pose_msg.pose.position.x
-        tf_msg.transform.translation.y = pose_msg.pose.position.y
-        tf_msg.transform.translation.z = pose_msg.pose.position.z
-        tf_msg.transform.rotation = pose_msg.pose.orientation
+        tf_msg.header                    = pose_msg.header
+        tf_msg.child_frame_id            = self.board_frame
+        tf_msg.transform.translation.x   = x_m
+        tf_msg.transform.translation.y   = y_m
+        tf_msg.transform.translation.z   = z_m
+        tf_msg.transform.rotation        = pose_msg.pose.orientation
         self.tf_broadcaster.sendTransform(tf_msg)
 
+        # ── RViz2 markers ────────────────────────────────────────────────
+        # Green sphere at board center
+        marker_array.markers.append(
+            self._make_sphere(0, x_m, y_m, z_m, 0.0, 1.0, 0.0, size=0.07))
+
+        # White line from camera origin to board
+        marker_array.markers.append(
+            self._make_line(1, x_m, y_m, z_m, 1.0, 1.0, 1.0))
+
+        # Text labels (white)
+        marker_array.markers.append(
+            self._make_text(2, x_m, y_m + 0.08, z_m,
+                f'X: {x_m*100:.1f} cm', 1.0, 1.0, 1.0))
+        marker_array.markers.append(
+            self._make_text(3, x_m, y_m + 0.13, z_m,
+                f'Y: {y_m*100:.1f} cm', 1.0, 1.0, 1.0))
+        marker_array.markers.append(
+            self._make_text(4, x_m, y_m + 0.18, z_m,
+                f'Z: {z_m*100:.1f} cm', 1.0, 1.0, 1.0))
+        marker_array.markers.append(
+            self._make_text(5, x_m, y_m + 0.23, z_m,
+                f'IDs: {sorted(used_ids)}', 0.0, 1.0, 0.0))
+
+        self.markers_pub.publish(marker_array)
+
+        # ── OpenCV debug image overlay ───────────────────────────────────
+        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+        cv2.drawFrameAxes(
+            frame, self.camera_matrix, self.dist_coeffs,
+            rvec, tvec, 0.05)
+
+        # Info panel background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (300, 160), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+        cv2.putText(frame, f'IDs: {sorted(used_ids)}',
+            (18, 35),  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f'X:  {x_m*100:+7.1f} cm',
+            (18, 63),  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f'Y:  {y_m*100:+7.1f} cm',
+            (18, 91),  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f'Z:  {z_m*100:+7.1f} cm',
+            (18, 119), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f'Yaw:{math.degrees(yaw):+7.1f} deg',
+            (18, 147), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        debug_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+        debug_msg.header = msg.header
+        self.debug_image_pub.publish(debug_msg)
+
+        # ── Logging ──────────────────────────────────────────────────────
         self.frame_count += 1
         if self.log_pose and self.frame_count % max(1, self.log_every_n) == 0:
             rx, ry, rz = roll, pitch, yaw
@@ -289,7 +465,7 @@ class BoardPoseNode(Node):
                 rx, ry, rz = map(math.degrees, (roll, pitch, yaw))
             self.get_logger().info(
                 f"visible=True ids={used_ids} "
-                f"x={tvec[0][0]:.4f} y={tvec[1][0]:.4f} z={tvec[2][0]:.4f} "
+                f"x={x_m:.4f} y={y_m:.4f} z={z_m:.4f} "
                 f"rx={rx:.4f} ry={ry:.4f} rz={rz:.4f}"
             )
 
