@@ -30,7 +30,7 @@ def generate_launch_description():
     rviz_config = os.path.join(
         tracker_pkg, '..', '..', '..', '..',
         'src', 'turtlebot4-sft-aruco-kf-pf-recovery-main',
-        'RAS598 Mobile Robotics Final.rviz'
+        'tracker.rviz'
     )
 
     # ── 1. Board pose node ────────────────────────────────────────────────
