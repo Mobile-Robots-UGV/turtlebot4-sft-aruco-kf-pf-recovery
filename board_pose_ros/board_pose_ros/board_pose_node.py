@@ -14,6 +14,7 @@ from std_msgs.msg import Bool, Int32MultiArray, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 
 DICT_MAP = {
@@ -153,12 +154,20 @@ class BoardPoseNode(Node):
             MarkerArray, "/robot_09/board_markers", 10)
 
         # ── Subscriber ───────────────────────────────────────────────────
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,  # ← only keep the latest frame
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
         self.sub = self.create_subscription(
             CompressedImage,
             self.image_topic,
             self.image_callback,
-            10,
+            qos,
         )
+
 
         self.frame_count = 0
         self.get_logger().info(f"Subscribed to {self.image_topic}")

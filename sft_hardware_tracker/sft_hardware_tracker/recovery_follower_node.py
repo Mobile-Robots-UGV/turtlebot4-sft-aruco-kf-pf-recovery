@@ -4,6 +4,7 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import LaserScan
@@ -15,7 +16,7 @@ class RecoveryFollowerNode(Node):
     Hardware follower with short prediction-based recovery.
 
     measured:
-      normal visual following
+      normal visual following with PD control and deadband
 
     predicted:
       cautious predicted tracking with LiDAR safety guard
@@ -35,13 +36,20 @@ class RecoveryFollowerNode(Node):
         self.declare_parameter('min_distance_m', 0.45)
 
         self.declare_parameter('kp_linear', 0.35)
-        self.declare_parameter('kp_angular', 0.90)
+        self.declare_parameter('kp_angular', 0.1)   # reduced from 0.90 → less aggressive turns
+
+        # D term for angular — dampens overshoot
+        self.declare_parameter('kd_angular', 0.08)
+
+        # Deadband — ignore small errors to prevent jitter
+        self.declare_parameter('x_deadband_m', 0.04)   # meters in camera x
+        self.declare_parameter('z_deadband_m', 0.03)   # meters in camera z
 
         self.declare_parameter('max_linear_measured', 0.15)
-        self.declare_parameter('max_angular_measured', 0.45)
+        self.declare_parameter('max_angular_measured', 0.30)  # reduced from 0.45
 
         self.declare_parameter('max_linear_predicted', 0.06)
-        self.declare_parameter('max_angular_predicted', 0.20)
+        self.declare_parameter('max_angular_predicted', 0.15)  # reduced from 0.20
 
         self.declare_parameter('pose_timeout_s', 0.5)
         self.declare_parameter('publish_rate_hz', 20.0)
@@ -50,56 +58,62 @@ class RecoveryFollowerNode(Node):
         self.declare_parameter('front_stop_distance_m', 0.45)
         self.declare_parameter('front_slow_distance_m', 0.80)
 
-        self.desired_distance_m = float(self.get_parameter('desired_distance_m').value)
-        self.min_distance_m = float(self.get_parameter('min_distance_m').value)
-
-        self.kp_linear = float(self.get_parameter('kp_linear').value)
-        self.kp_angular = float(self.get_parameter('kp_angular').value)
-
-        self.max_linear_measured = float(self.get_parameter('max_linear_measured').value)
-        self.max_angular_measured = float(self.get_parameter('max_angular_measured').value)
-
-        self.max_linear_predicted = float(self.get_parameter('max_linear_predicted').value)
-        self.max_angular_predicted = float(self.get_parameter('max_angular_predicted').value)
-
-        self.pose_timeout_s = float(self.get_parameter('pose_timeout_s').value)
-
-        self.front_stop_distance_m = float(
-            self.get_parameter('front_stop_distance_m').value
-        )
-        self.front_slow_distance_m = float(
-            self.get_parameter('front_slow_distance_m').value
-        )
+        self.desired_distance_m     = float(self.get_parameter('desired_distance_m').value)
+        self.min_distance_m         = float(self.get_parameter('min_distance_m').value)
+        self.kp_linear              = float(self.get_parameter('kp_linear').value)
+        self.kp_angular             = float(self.get_parameter('kp_angular').value)
+        self.kd_angular             = float(self.get_parameter('kd_angular').value)
+        self.x_deadband_m           = float(self.get_parameter('x_deadband_m').value)
+        self.z_deadband_m           = float(self.get_parameter('z_deadband_m').value)
+        self.max_linear_measured    = float(self.get_parameter('max_linear_measured').value)
+        self.max_angular_measured   = float(self.get_parameter('max_angular_measured').value)
+        self.max_linear_predicted   = float(self.get_parameter('max_linear_predicted').value)
+        self.max_angular_predicted  = float(self.get_parameter('max_angular_predicted').value)
+        self.pose_timeout_s         = float(self.get_parameter('pose_timeout_s').value)
+        self.front_stop_distance_m  = float(self.get_parameter('front_stop_distance_m').value)
+        self.front_slow_distance_m  = float(self.get_parameter('front_slow_distance_m').value)
 
         tracked_pose_topic = self.get_parameter('tracked_pose_topic').value
-        status_topic = self.get_parameter('status_topic').value
-        cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
-        scan_topic = self.get_parameter('scan_topic').value
+        status_topic       = self.get_parameter('status_topic').value
+        cmd_vel_topic      = self.get_parameter('cmd_vel_topic').value
+        scan_topic         = self.get_parameter('scan_topic').value
 
-        self.latest_pose = None
+        self.latest_pose      = None
         self.latest_pose_time = None
-        self.status = 'lost'
-        self.front_min_range = float('inf')
+        self.status           = 'lost'
+        self.front_min_range  = float('inf')
+
+        # D term state — track previous x error and time
+        self.prev_x        = 0.0
+        self.prev_time     = None
+
+        # ── QoS: depth=1 → always use latest pose, never stale ──────────
+        qos_latest = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
 
         self.sub_pose = self.create_subscription(
             PoseStamped,
             tracked_pose_topic,
             self.pose_callback,
-            10
+            qos_latest,
         )
 
         self.sub_status = self.create_subscription(
             String,
             status_topic,
             self.status_callback,
-            10
+            qos_latest,
         )
 
         self.sub_scan = self.create_subscription(
             LaserScan,
             scan_topic,
             self.scan_callback,
-            10
+            qos_latest,
         )
 
         self.pub_cmd = self.create_publisher(TwistStamped, cmd_vel_topic, 10)
@@ -108,13 +122,15 @@ class RecoveryFollowerNode(Node):
         self.timer = self.create_timer(1.0 / rate, self.timer_callback)
 
         self.get_logger().info('Recovery follower node started')
+        self.get_logger().info(f'kp_angular={self.kp_angular} kd_angular={self.kd_angular}')
+        self.get_logger().info(f'x_deadband={self.x_deadband_m}m z_deadband={self.z_deadband_m}m')
         self.get_logger().info(f'Subscribing tracked pose: {tracked_pose_topic}')
         self.get_logger().info(f'Subscribing status: {status_topic}')
         self.get_logger().info(f'Subscribing scan: {scan_topic}')
         self.get_logger().info(f'Publishing cmd_vel: {cmd_vel_topic}')
 
     def pose_callback(self, msg: PoseStamped):
-        self.latest_pose = msg
+        self.latest_pose      = msg
         self.latest_pose_time = self.get_clock().now()
 
     def status_callback(self, msg: String):
@@ -123,13 +139,11 @@ class RecoveryFollowerNode(Node):
     def scan_callback(self, msg: LaserScan):
         """
         Estimate nearest obstacle in front of the robot.
-
         Uses approximately +/- 25 degrees in front of base_link.
         """
         front_angle_rad = math.radians(25.0)
-
         ranges = []
-        angle = msg.angle_min
+        angle  = msg.angle_min
 
         for r in msg.ranges:
             if -front_angle_rad <= angle <= front_angle_rad:
@@ -137,91 +151,98 @@ class RecoveryFollowerNode(Node):
                     ranges.append(r)
             angle += msg.angle_increment
 
-        if len(ranges) == 0:
-            self.front_min_range = float('inf')
-        else:
-            self.front_min_range = min(ranges)
+        self.front_min_range = min(ranges) if ranges else float('inf')
 
     def timer_callback(self):
         cmd = TwistStamped()
-        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.header.stamp    = self.get_clock().now().to_msg()
         cmd.header.frame_id = 'base_link'
 
+        # ── Stop if no pose received yet ─────────────────────────────────
         if self.latest_pose is None or self.latest_pose_time is None:
             self.pub_cmd.publish(cmd)
             return
 
-        now = self.get_clock().now()
+        # ── Stop if pose is stale ────────────────────────────────────────
+        now   = self.get_clock().now()
         age_s = (now - self.latest_pose_time).nanoseconds * 1e-9
-
         if age_s > self.pose_timeout_s:
             self.pub_cmd.publish(cmd)
             return
 
+        # ── Stop if lost ─────────────────────────────────────────────────
         if self.status == 'lost':
+            self.prev_x    = 0.0
+            self.prev_time = None
             self.pub_cmd.publish(cmd)
             return
 
         x = float(self.latest_pose.pose.position.x)
         z = float(self.latest_pose.pose.position.z)
 
+        # ── Linear control with deadband ─────────────────────────────────
         distance_error = z - self.desired_distance_m
+        if abs(distance_error) < self.z_deadband_m:
+            distance_error = 0.0
         linear = self.kp_linear * distance_error
 
-        # If the board is too close, only allow slow reverse motion.
-        # Do not allow forward motion when inside min_distance_m.
+        # If board is too close, only allow reverse
         if z < self.min_distance_m:
             linear = min(linear, 0.0)
 
-        # Camera frame: +x means board appears to robot's right.
-        # If the robot turns the wrong way, flip this sign.
-        angular = -self.kp_angular * x
+        # ── Angular control with deadband + D term ───────────────────────
+        if abs(x) < self.x_deadband_m:
+            # Inside deadband — zero error, reset D term
+            x_error  = 0.0
+            angular  = 0.0
+            self.prev_x    = 0.0
+            self.prev_time = now
+        else:
+            x_error = x
 
+            # Compute D term if we have previous data
+            if self.prev_time is not None:
+                dt = (now - self.prev_time).nanoseconds * 1e-9
+                dt = max(dt, 1e-6)
+                x_dot = (x_error - self.prev_x) / dt
+            else:
+                x_dot = 0.0
+
+            # PD angular control
+            # P term: proportional to lateral error
+            # D term: resists fast changes → dampens overshoot
+            angular = -(self.kp_angular * x_error + self.kd_angular * x_dot)
+
+            self.prev_x    = x_error
+            self.prev_time = now
+
+        # ── Apply speed limits based on tracker status ───────────────────
         if self.status == 'measured':
-            linear = self.clamp(
-                linear,
-                -self.max_linear_measured,
-                self.max_linear_measured
-            )
-            angular = self.clamp(
-                angular,
-                -self.max_angular_measured,
-                self.max_angular_measured
-            )
+            linear  = self.clamp(linear,  -self.max_linear_measured,  self.max_linear_measured)
+            angular = self.clamp(angular, -self.max_angular_measured,  self.max_angular_measured)
 
         elif self.status == 'predicted':
-            # In predicted mode, do not blindly drive through obstacles.
-            # Allow cautious rotation for reacquisition, but forward motion is heavily limited.
-            linear = self.clamp(
-                linear,
-                0.0,
-                self.max_linear_predicted
-            )
-            angular = self.clamp(
-                angular,
-                -self.max_angular_predicted,
-                self.max_angular_predicted
-            )
+            # Cautious — no backward motion, very slow forward
+            linear  = self.clamp(linear,  0.0, self.max_linear_predicted)
+            angular = self.clamp(angular, -self.max_angular_predicted, self.max_angular_predicted)
 
-            # Extra conservative behavior during prediction.
-            # If anything is near the front, stop forward motion.
+            # Stop forward if obstacle nearby during prediction
             if self.front_min_range < self.front_slow_distance_m:
                 linear = 0.0
 
         else:
-            linear = 0.0
+            linear  = 0.0
             angular = 0.0
 
-        # LiDAR safety guard for all forward motion.
-        # This does not plan around obstacles yet. It prevents forward collision.
+        # ── LiDAR safety guard for all forward motion ────────────────────
         if linear > 0.0:
             if self.front_min_range < self.front_stop_distance_m:
-                linear = 0.0
+                linear  = 0.0
                 angular = 0.0
             elif self.front_min_range < self.front_slow_distance_m:
                 linear = min(linear, 0.03)
 
-        cmd.twist.linear.x = linear
+        cmd.twist.linear.x  = linear
         cmd.twist.angular.z = angular
 
         self.get_logger().info(
@@ -229,7 +250,7 @@ class RecoveryFollowerNode(Node):
             f"x={x:.3f} z={z:.3f} "
             f"front={self.front_min_range:.3f} "
             f"linear={linear:.3f} angular={angular:.3f}",
-            throttle_duration_sec=0.5
+            throttle_duration_sec=0.5,
         )
 
         self.pub_cmd.publish(cmd)

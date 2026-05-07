@@ -36,10 +36,10 @@ recovery_follower_node:
     min_distance_m: 0.30
 
     kp_linear: 0.35
-    kp_angular: 0.90
+    kp_angular: 0.25
 
     max_linear_measured: 0.15
-    max_angular_measured: 0.45
+    max_angular_measured: 0.30
 
     # Keep predicted motion very cautious.
     max_linear_predicted: 0.02
@@ -54,3 +54,7 @@ recovery_follower_node:
     scan_topic: /robot_09/scan
     front_stop_distance_m: 0.45
     front_slow_distance_m: 0.80
+
+    x_deadband_m: 0.08    # was 0.04 → now 8cm = ~7 degrees tolerance
+    z_deadband_m: 0.05    # was 0.03
+    kd_angular: 0.10      # increase damping
